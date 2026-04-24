@@ -2,7 +2,7 @@
 """
 庄家收筹雷达 v1 — 发现庄家横盘吸筹 + OI异动
 
-核心逻辑：
+核心逻辑（Patrick教的）：
 1. 庄家拉盘前必须先收筹 → 长期横盘+低量 = 收筹中
 2. OI暴涨 = 大资金进场建仓 = 即将拉盘
 3. 两个信号叠加 = 最强信号
@@ -152,11 +152,13 @@ def analyze_accumulation(symbol, klines):
     
     # === 寻找横盘区间 ===
     # 从最近往回找，找最长的横盘期（价格波动<MAX_RANGE_PCT%）
+    # 关键：必须是真横盘（斜率接近零），阴跌不算横盘！
     best_sideways = 0
     best_range = 0
     best_low = 0
     best_high = 0
     best_avg_vol = 0
+    best_slope_pct = 0
     
     # 用滑动窗口从60天到全部
     for window in range(MIN_SIDEWAYS_DAYS, len(prior) + 1):
@@ -175,12 +177,28 @@ def analyze_accumulation(symbol, klines):
         if range_pct <= MAX_RANGE_PCT:
             avg_vol = sum(d["vol"] for d in window_data) / len(window_data)
             if avg_vol <= MAX_AVG_VOL_USD:
+                # 线性回归算斜率：阴跌/暴涨不算横盘
+                closes = [d["close"] for d in window_data]
+                n = len(closes)
+                x_mean = (n - 1) / 2.0
+                y_mean = sum(closes) / n
+                num = sum((i - x_mean) * (c - y_mean) for i, c in enumerate(closes))
+                den = sum((i - x_mean) ** 2 for i in range(n))
+                slope = num / den if den > 0 else 0
+                # 累计变化占起始价的百分比
+                slope_pct = (slope * n / closes[0] * 100) if closes[0] > 0 else 0
+                
+                # 斜率过滤：累计变化超过±20%不算横盘
+                if abs(slope_pct) > 20:
+                    continue
+                
                 if window > best_sideways:
                     best_sideways = window
                     best_range = range_pct
                     best_low = w_low
                     best_high = w_high
                     best_avg_vol = avg_vol
+                    best_slope_pct = slope_pct
     
     if best_sideways < MIN_SIDEWAYS_DAYS:
         return None
@@ -200,7 +218,7 @@ def analyze_accumulation(symbol, klines):
     vol_breakout = recent_vol / best_avg_vol if best_avg_vol > 0 else 0
     breakout_score = min(vol_breakout / VOL_BREAKOUT_MULT, 1.0) * 15  # 放量加分，满分15
     
-    # 市值越低空间越大（核心！低市值=大空间）
+    # 市值越低空间越大（核心！Patrick: 低市值=大空间）
     # 用当前价格*日均成交量/换手率来粗估市值排名
     # 实际市值在推送时用CoinGecko补充
     est_mcap = data[-1]["close"] * best_avg_vol * 30  # 粗略估算
@@ -217,6 +235,10 @@ def analyze_accumulation(symbol, klines):
     
     total_score = days_score + range_score + vol_score + breakout_score + mcap_score
     
+    # 横盘质量加分：斜率越接近零越好（真横盘bonus，满分+5）
+    flatness_bonus = max(0, (1 - abs(best_slope_pct) / 20)) * 5
+    total_score += flatness_bonus
+    
     # 状态判断
     if vol_breakout >= VOL_BREAKOUT_MULT:
         status = "🔥放量启动"
@@ -230,6 +252,7 @@ def analyze_accumulation(symbol, klines):
         "coin": coin,
         "sideways_days": best_sideways,
         "range_pct": best_range,
+        "slope_pct": best_slope_pct,
         "low_price": best_low,
         "high_price": best_high,
         "avg_vol": best_avg_vol,
@@ -658,7 +681,49 @@ def main():
         except Exception as e:
             print(f"⚠️ 市值API失败，走fallback: {e}")
         
-        # 2. 从DB读收筹数据
+        # 2. 拉热度数据（CoinGecko Trending + 成交量暴增）
+        heat_map = {}  # coin名 -> heat_score (0-100)
+        cg_trending = set()
+        try:
+            import requests as _req
+            _r = _req.get("https://api.coingecko.com/api/v3/search/trending", timeout=10)
+            if _r.status_code == 200:
+                for item in _r.json().get("coins", []):
+                    sym = item["item"]["symbol"].upper()
+                    rank = item["item"].get("score", 99)
+                    cg_trending.add(sym)
+                    heat_map[sym] = heat_map.get(sym, 0) + max(50 - rank * 3, 10)  # top1=50分, top10=20分
+                print(f"🔥 CoinGecko Trending: {len(cg_trending)}个币")
+        except Exception as e:
+            print(f"⚠️ CG Trending失败: {e}")
+        
+        # 成交量暴增检测（24hVol vs 5日均Vol）
+        vol_surge_coins = set()
+        for sym, tk in ticker_map.items():
+            coin = sym.replace("USDT", "")
+            vol_24h = tk["vol"]
+            # 快速拿5天均量（用ticker的数据粗估，精确版在后面OI扫描时补充）
+            # 这里先标记vol > $20M的为候选
+            if vol_24h > 20_000_000:
+                kl = api_get("/fapi/v1/klines", {"symbol": sym, "interval": "1d", "limit": 6})
+                if kl and len(kl) >= 5:
+                    avg_5d = sum(float(k[7]) for k in kl[:-1]) / (len(kl)-1)
+                    if avg_5d > 0:
+                        ratio = vol_24h / avg_5d
+                        if ratio >= 2.5:  # 成交量放大2.5倍以上
+                            vol_surge_coins.add(coin)
+                            heat_map[coin] = heat_map.get(coin, 0) + min(ratio * 10, 50)  # 最高50分
+                    import time; time.sleep(0.05)
+        
+        print(f"📈 成交量暴增(≥2.5x): {len(vol_surge_coins)}个币")
+        # 双重热度
+        dual_heat = cg_trending & vol_surge_coins
+        if dual_heat:
+            for coin in dual_heat:
+                heat_map[coin] = heat_map.get(coin, 0) + 20  # 双重信号bonus
+            print(f"🔥🔥 双重热度: {dual_heat}")
+        
+        # 3. 从DB读收筹数据
         c2 = conn.cursor()
         c2.execute("SELECT symbol, score, sideways_days, range_pct, avg_vol, status FROM watchlist")
         pool_map = {}
@@ -717,13 +782,17 @@ def main():
             sw_days = pool.get("sideways_days", 0) if pool else 0
             pool_sc = pool.get("pool_score", 0) if pool else 0
             
+            heat = heat_map.get(coin, 0)
+            
             coin_data[sym] = {
                 "coin": coin, "sym": sym,
                 "px_chg": tk["px_chg"], "vol": tk["vol"],
                 "fr_pct": fr_pct, "d6h": d6h,
                 "oi_usd": oi_usd, "est_mcap": est_mcap,
                 "sw_days": sw_days, "pool_sc": pool_sc,
-                "in_pool": bool(pool),
+                "in_pool": bool(pool), "heat": heat,
+                "in_cg": coin in cg_trending,
+                "vol_surge": coin in vol_surge_coins,
             }
         
         # ═══════════════════════════════════════
@@ -865,9 +934,29 @@ def main():
         
         now = datetime.now(timezone(timedelta(hours=8)))
         lines = [
-            f"🏦 **庄家雷达** 三策略",
+            f"🏦 **庄家雷达** 三策略+热度",
             f"⏰ {now.strftime('%Y-%m-%d %H:%M')} CST",
         ]
+        
+        # 表0: 热度榜（最重要，放最前面）
+        hot_coins = sorted(
+            [d for d in coin_data.values() if d["heat"] > 0],
+            key=lambda x: x["heat"], reverse=True
+        )
+        if hot_coins:
+            lines.append(f"\n🔥 **热度榜** (CG趋势+成交量暴增)")
+            for s in hot_coins[:8]:
+                tags = []
+                if s["in_cg"]: tags.append("🌐CG热搜")
+                if s["vol_surge"]: tags.append("📈放量")
+                oi_tag = f"OI{s['d6h']:+.0f}%" if abs(s["d6h"]) >= 3 else ""
+                if oi_tag: tags.append(f"⚡{oi_tag}")
+                if s["in_pool"]: tags.append(f"💤池{s['sw_days']}天")
+                fr_tag = f"🧊{s['fr_pct']:.2f}%" if s["fr_pct"] < -0.03 else ""
+                if fr_tag: tags.append(fr_tag)
+                lines.append(
+                    f"  {s['coin']:<8} ~{mcap_str(s['est_mcap'])} 涨{s['px_chg']:+.0f}% | {' '.join(tags)}"
+                )
         
         # 表1: 追多
         lines.append(f"\n🔥 **追多** (按费率排名)")
@@ -907,6 +996,20 @@ def main():
         # ═══ 值得关注提醒 ═══
         highlights = []
         
+        # 热度+收筹池重叠 = 最强信号（放最前面！热度领先OI）
+        hot_pool = [d for d in coin_data.values() if d["heat"] > 0 and d["in_pool"]]
+        for s in sorted(hot_pool, key=lambda x: x["heat"], reverse=True)[:2]:
+            tags = []
+            if s["in_cg"]: tags.append("CG热搜")
+            if s["vol_surge"]: tags.append("放量")
+            highlights.append(f"🔥💤 {s['coin']} 热度({'+'.join(tags)})+收筹{s['sw_days']}天=OI将涨")
+        
+        # 热度+OI已经在涨 = 正在发生
+        hot_oi = [d for d in coin_data.values() if d["heat"] > 0 and d["d6h"] > 5]
+        for s in sorted(hot_oi, key=lambda x: x["d6h"], reverse=True)[:2]:
+            if s["coin"] not in " ".join(highlights):
+                highlights.append(f"🔥⚡ {s['coin']} 热度+OI{s['d6h']:+.0f}%双涨！")
+        
         # 追多里费率加速恶化的前2
         chase_fire = [s for s in chase[:5] if "加速" in s.get("trend", "")]
         for s in chase_fire[:2]:
@@ -936,14 +1039,14 @@ def main():
         
         if highlights:
             lines.append(f"\n💡 **值得关注**")
-            for h in highlights[:5]:
+            for h in highlights[:7]:
                 lines.append(f"  {h}")
         
         # 图例说明
         lines.append(f"\n📖 **图例**")
-        lines.append("  费率负=空头多(燃料) | 🔥加速/⬇️变负/⬆️回升=费率趋势")
-        lines.append("  💎市值 | 💤横盘天数(收筹时长) | ⚡OI变化(资金异动)")
-        lines.append("  🎯暗流=OI动但价没动(收筹信号)")
+        lines.append("  🔥热度=CG热搜+成交量暴增(OI领先指标)")
+        lines.append("  费率负=空头燃料 | 💎市值 | 💤横盘(收筹)")
+        lines.append("  🔥💤热度+收筹=最强预判 | 🔥⚡热度+OI=正在发生")
         
         report = "\n".join(lines)
         send_telegram(report)

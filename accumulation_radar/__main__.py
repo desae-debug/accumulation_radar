@@ -44,7 +44,8 @@ def run_oi(conn):
     pool_map = load_pool_map(conn)
     scan_syms = set()
     for sym, pd in pool_map.items():
-        if "放量" in pd.get("status", "") or "开始" in pd.get("status", ""):
+        st = pd.get("status", "")
+        if st in ("firing", "warming"):
             scan_syms.add(sym)
     top_by_vol = sorted(ticker_map.items(), key=lambda x: x[1]["vol"], reverse=True)[:100]
     for sym, _ in top_by_vol:

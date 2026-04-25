@@ -1,9 +1,11 @@
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
 from .api import api_get
 from .config import logger
+
+OI_WORKERS = 4
 
 
 def fetch_market_data():
@@ -65,19 +67,30 @@ def fetch_heat_data(ticker_map):
 
     vol_surge_coins = set()
     top_vol_syms = sorted(ticker_map.items(), key=lambda x: x[1]["vol"], reverse=True)[:200]
-    for sym, tk in top_vol_syms:
+
+    def _check_vol_surge(sym_tk):
+        sym, tk = sym_tk
         coin = sym.replace("USDT", "")
         vol_24h = tk["vol"]
-        if vol_24h > 50_000_000:
-            kl = api_get("/fapi/v1/klines", {"symbol": sym, "interval": "1d", "limit": 6})
-            if kl and len(kl) >= 5:
-                avg_5d = sum(float(k[7]) for k in kl[:-1]) / (len(kl) - 1)
-                if avg_5d > 0:
-                    ratio = vol_24h / avg_5d
-                    if ratio >= 2.5:
-                        vol_surge_coins.add(coin)
-                        heat_map[coin] = heat_map.get(coin, 0) + min(ratio * 10, 50)
-            time.sleep(0.05)
+        if vol_24h <= 50_000_000:
+            return None
+        kl = api_get("/fapi/v1/klines", {"symbol": sym, "interval": "1d", "limit": 6})
+        if kl and len(kl) >= 5:
+            avg_5d = sum(float(k[7]) for k in kl[:-1]) / (len(kl) - 1)
+            if avg_5d > 0:
+                ratio = vol_24h / avg_5d
+                if ratio >= 2.5:
+                    return coin, ratio
+        return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(_check_vol_surge, item) for item in top_vol_syms]
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result:
+                coin, ratio = result
+                vol_surge_coins.add(coin)
+                heat_map[coin] = heat_map.get(coin, 0) + min(ratio * 10, 50)
 
     logger.info(f"📈 成交量暴增(≥2.5x): {len(vol_surge_coins)}个币")
     dual_heat = cg_trending & vol_surge_coins
@@ -89,23 +102,35 @@ def fetch_heat_data(ticker_map):
     return heat_map, cg_trending, vol_surge_coins
 
 
+def _fetch_oi(sym):
+    oi_hist = api_get("/futures/data/openInterestHist", {
+        "symbol": sym, "period": "1h", "limit": 6
+    })
+    if oi_hist and len(oi_hist) >= 2:
+        curr = float(oi_hist[-1]["sumOpenInterestValue"])
+        prev_1h = float(oi_hist[-2]["sumOpenInterestValue"])
+        prev_6h = float(oi_hist[0]["sumOpenInterestValue"])
+        d1h = ((curr - prev_1h) / prev_1h * 100) if prev_1h > 0 else 0
+        d6h = ((curr - prev_6h) / prev_6h * 100) if prev_6h > 0 else 0
+        circ_supply = float(oi_hist[-1].get("CMCCirculatingSupply", 0))
+        return sym, {"oi_usd": curr, "d1h": d1h, "d6h": d6h, "circ_supply": circ_supply}
+    return sym, None
+
+
 def scan_oi_history(scan_syms):
-    """批量扫描OI历史"""
+    """批量并发扫描OI历史"""
     oi_map = {}
-    for i, sym in enumerate(scan_syms):
-        oi_hist = api_get("/futures/data/openInterestHist", {
-            "symbol": sym, "period": "1h", "limit": 6
-        })
-        if oi_hist and len(oi_hist) >= 2:
-            curr = float(oi_hist[-1]["sumOpenInterestValue"])
-            prev_1h = float(oi_hist[-2]["sumOpenInterestValue"])
-            prev_6h = float(oi_hist[0]["sumOpenInterestValue"])
-            d1h = ((curr - prev_1h) / prev_1h * 100) if prev_1h > 0 else 0
-            d6h = ((curr - prev_6h) / prev_6h * 100) if prev_6h > 0 else 0
-            circ_supply = float(oi_hist[-1].get("CMCCirculatingSupply", 0))
-            oi_map[sym] = {"oi_usd": curr, "d1h": d1h, "d6h": d6h, "circ_supply": circ_supply}
-        if (i + 1) % 10 == 0:
-            time.sleep(0.5)
+    syms = list(scan_syms)
+    logger.info(f"  扫描 {len(syms)} 个OI历史，{OI_WORKERS} 线程并发")
+
+    with ThreadPoolExecutor(max_workers=OI_WORKERS) as pool:
+        futures = [pool.submit(_fetch_oi, sym) for sym in syms]
+        for fut in as_completed(futures):
+            sym, data = fut.result()
+            if data:
+                oi_map[sym] = data
+
+    logger.info(f"  ✅ 获取 {len(oi_map)} 个OI数据")
     return oi_map
 
 

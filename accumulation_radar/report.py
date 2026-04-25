@@ -14,6 +14,29 @@ def mcap_str(v):
     return f"${v:.0f}"
 
 
+def fmt_price(v):
+    """智能价格格式：大币2位，小币自适应"""
+    if v <= 0:
+        return "$0"
+    if v >= 100:
+        return f"${v:.2f}"
+    if v >= 1:
+        return f"${v:.4f}"
+    if v >= 0.01:
+        return f"${v:.6f}"
+    # 极小币：去前导零后取4位有效数字
+    s = f"{v:.8f}".rstrip("0")
+    return f"${s}"
+
+
+# 状态显示映射
+STATUS_DISPLAY = {
+    "firing": "🔥放量启动",
+    "warming": "⚡开始放量",
+    "sleeping": "💤收筹中",
+}
+
+
 def build_pool_report(results):
     """生成收筹标的池报告"""
     if not results:
@@ -28,9 +51,9 @@ def build_pool_report(results):
         "",
     ]
 
-    firing = [r for r in results if "放量启动" in r["status"]]
-    warming = [r for r in results if "开始放量" in r["status"]]
-    sleeping = [r for r in results if "收筹中" in r["status"]]
+    firing = [r for r in results if r["status"] == "firing"]
+    warming = [r for r in results if r["status"] == "warming"]
+    sleeping = [r for r in results if r["status"] == "sleeping"]
 
     if firing:
         lines.append(f"🔥 **放量启动** ({len(firing)}个) — 最高优先级！")
@@ -41,8 +64,8 @@ def build_pool_report(results):
                 f"Vol放大{r['vol_breakout']:.1f}x"
             )
             lines.append(
-                f"     ${r['current_price']:.6f} | "
-                f"区间: ${r['low_price']:.6f}~${r['high_price']:.6f} | "
+                f"     {fmt_price(r['current_price'])} | "
+                f"区间: {fmt_price(r['low_price'])}~{fmt_price(r['high_price'])} | "
                 f"日均Vol: {format_usd(r['avg_vol'])}"
             )
         lines.append("")
@@ -98,34 +121,39 @@ def build_strategy_report(coin_data, chase, combined, ambush):
             )
 
     # 追多
-    lines.append(f"\n🔥 **追多** (按费率排名)")
+    lines.append(f"\n🔥 **追多** (费率负+OI确认+量能)")
     if chase:
         for s in chase[:8]:
+            extras = [s["trend"]]
+            if s.get("oi_confirm"): extras.append(s["oi_confirm"])
+            if s.get("vol_tag"): extras.append(s["vol_tag"])
             lines.append(
-                f"  {s['coin']:<7} 费率{s['fr_pct']:+.3f}% {s['trend']}"
+                f"  {s['coin']:<7} 费率{s['fr_pct']:+.3f}% {' '.join(extras)}"
                 f" | 涨{s['px_chg']:+.0f}% | ~{mcap_str(s['est_mcap'])}"
             )
     else:
         lines.append("  暂无（需涨>3%+费率负）")
 
     # 综合
-    lines.append(f"\n📊 **综合** (费率+市值+横盘+OI 各25)")
+    lines.append(f"\n📊 **综合** (费率30+OI30+市值20+横盘20)")
     for s in combined[:8]:
         dims = []
-        if s["f_sc"] >= 10: dims.append(f"🧊{s['fr_pct']:.2f}%")
-        if s["m_sc"] >= 12: dims.append(f"💎{mcap_str(s['est_mcap'])}")
+        if s["f_sc"] >= 15: dims.append(f"🧊{s['fr_pct']:.2f}%")
+        if s["m_sc"] >= 10: dims.append(f"💎{mcap_str(s['est_mcap'])}")
         if s["s_sc"] >= 10: dims.append(f"💤{s['sw_days']}天")
-        if s["o_sc"] >= 10: dims.append(f"⚡OI{s['d6h']:+.0f}%")
+        if s["o_sc"] >= 15: dims.append(f"⚡OI{s['d6h']:+.0f}%")
+        if s.get("bonus"): dims.append(f"🔗联{s['bonus']}")
         lines.append(f"  {s['coin']:<7} {s['total']}分 | {' '.join(dims)}")
 
     # 埋伏
-    lines.append(f"\n🎯 **埋伏** (市值35+OI30+横盘20+费率15)")
+    lines.append(f"\n🎯 **埋伏** (市值30+OI25+横盘20+暗流15+热度10)")
     for s in ambush[:8]:
         tags = [f"~{mcap_str(s['est_mcap'])}"]
         if abs(s["d6h"]) >= 2: tags.append(f"OI{s['d6h']:+.0f}%")
-        if s["d6h"] > 2 and abs(s["px_chg"]) < 5: tags.append("🎯暗流")
+        if s.get("dc_sc", 0) >= 10: tags.append("🎯暗流")
         if s["sw_days"] >= 45: tags.append(f"横盘{s['sw_days']}天")
         if s["fr_pct"] < -0.01: tags.append(f"费率{s['fr_pct']:.2f}%")
+        if s.get("h_sc", 0) >= 5: tags.append(f"🔥热{s.get('h_sc',0):.0f}")
         lines.append(f"  {s['coin']:<7} {s['total']}分 | {' '.join(tags)}")
 
     # 值得关注

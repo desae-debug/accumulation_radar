@@ -97,7 +97,7 @@ Python 3.8+ 就行，唯一的外部依赖是 requests。
 ### 配置 Telegram 推送（可选）
 
 ```bash
-cp .env.example .env.oi
+cp .env.oi .env.oi
 ```
 
 编辑 `.env.oi`，填入 `TG_BOT_TOKEN` 和 `TG_CHAT_ID`。不配的话报告会打印到 stdout。

@@ -5,7 +5,7 @@ from pathlib import Path
 # === 加载 .env ===
 env_file = Path(__file__).resolve().parent.parent / ".env.oi"
 if env_file.exists():
-    with open(env_file) as f:
+    with open(env_file,encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
